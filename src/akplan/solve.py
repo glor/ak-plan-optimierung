@@ -1,4 +1,47 @@
-"""Solving the MILPs for conference scheduling."""
+"""MILP construction, solving, result extraction, and the ``akplan-solve`` CLI.
+
+This module is the **core engine** of the package.  It has four public
+responsibilities:
+
+1. ``create_lp`` — translates a ``SchedulingInput`` into a fully-specified
+   linopy ``Model`` (binary variables, all constraints, objective function).
+
+2. ``solve_scheduling`` — wraps ``create_lp`` and hands the model to an ILP
+   solver (HiGHS or Gurobi), returning the solution arrays or ``None`` on
+   infeasibility.
+
+3. ``export_scheduling_result`` / ``process_solved_lp`` — read the solved
+   variable arrays and produce a ``dict[AkId, ScheduleAtom]`` that maps every
+   AK to its assigned room, timeslots, and participants.
+
+4. ``main`` — ``argparse``-based CLI entry point registered as ``akplan-solve``
+   in ``pyproject.toml``.
+
+MILP overview
+-------------
+Three families of binary decision variables are created:
+
+- ``Room[ak, room]`` — 1 if AK is in that room.
+- ``Time[ak, timeslot]`` — 1 if AK uses that timeslot.
+- ``Part[ak, person]`` — 1 if person attends that AK.
+
+Plus two auxiliary variables:
+
+- ``Block[ak, block]`` — 1 if AK is placed in that day-block.
+- ``Working[person, timeslot]`` — 1 if person is occupied in that slot.
+
+The objective maximises the sum of preference-weighted ``Part`` values,
+normalised per person so that people with many preferences don't dominate.
+
+For the full mathematical specification see:
+https://github.com/Die-KoMa/ak-plan-optimierung/wiki/LP-formulation
+
+Relationship to other modules
+------------------------------
+- Imports all dataclasses and preprocessing helpers from ``util``.
+- Imports type aliases and ``ExportTuple`` from ``types``.
+- Called by the test suite via ``solve_scheduling`` and ``process_solved_lp``.
+"""
 
 import argparse
 import json
@@ -35,9 +78,18 @@ T = TypeVar("T")
 def create_lp(
     input_data: SchedulingInput, solver_dir: str | None = None
 ) -> linopy.Model:
-    """Create the MILP problem as linopy model.
+    """Construct the MILP model for a conference scheduling problem.
 
-    Creates the problem with all constraints, preferences and the objective function.
+    Translates a fully-parsed ``SchedulingInput`` into a linopy ``Model``
+    with all variables, constraints, and the objective function.  The returned
+    model is ready to be handed to a solver via ``model.solve()``.
+
+    The construction proceeds in five phases:
+    1. Compute ``ProblemIds`` and ``ProblemProperties`` (all preprocessing).
+    2. Determine variable bounds (tighten bounds to prune the search space).
+    3. Add variables to the linopy model.
+    4. Set the objective function.
+    5. Add all hard constraints (feasibility, conflicts, dependencies, …).
 
     For a specification of the input JSON format, see
     https://github.com/Die-KoMa/ak-plan-optimierung/wiki/Input-&-output-format
@@ -45,19 +97,19 @@ def create_lp(
     For a specification of the MILP, see
     https://github.com/Die-KoMa/ak-plan-optimierung/wiki/LP-formulation
 
-    The MILP models each person to have three kinds of prefences for an AK:
-    0 (no preference), 1 (weak preference) and `mu` (strong preference).
-    The choice of `mu` is an hyperparameter of the MILP that weights the
+    The MILP models each person to have three kinds of preferences for an AK:
+    0 (no preference), 1 (weak preference) and ``mu`` (strong preference).
+    The choice of ``mu`` is a hyperparameter of the MILP that weights the
     balance between weak and strong preferences.
 
     Args:
-        input_data (SchedulingInput): The input data used to construct the MILP.
-        solver_dir (str, optional): Path where linopy's temporary files like the lp file
-            or the intermediate solution file should be stored.
-            The default None results in taking the default temporary directory.
+        input_data: The parsed and validated scheduling input.
+        solver_dir: Directory where linopy stores temporary LP and solution
+            files.  ``None`` (default) uses the system temp directory and
+            cleans up automatically after solving.
 
     Returns:
-        The constructed linopy model instance.
+        A linopy ``Model`` ready for solving.
     """
     time_lp_construction_start = perf_counter()
 
@@ -68,13 +120,26 @@ def create_lp(
 
     logger.debug("IDs and Properties initialized")
 
+    # ``force_dim_names=True`` makes linopy raise an error if a variable or
+    # constraint is created without named coordinate dimensions, preventing
+    # hard-to-debug broadcasting mistakes.
     # TODO: Consider chunking
     m = linopy.Model(force_dim_names=True, solver_dir=solver_dir)
 
-    # set initial values by setting lower/upper value of variable
+    # -------------------------------------------------------------------------
+    # Helper: default lower=0 / upper=1 bounds for a binary variable grid.
+    # -------------------------------------------------------------------------
     def _init_lower_upper(coords: list[pd.Index]) -> tuple[xr.DataArray, xr.DataArray]:
         return xr.DataArray(0, coords=coords), xr.DataArray(1, coords=coords)
 
+    # -------------------------------------------------------------------------
+    # Variable bounds — tighten before declaring variables so the solver does
+    # not waste time exploring provably infeasible assignments.
+    # -------------------------------------------------------------------------
+
+    # Part[ak, person]:
+    #   lower=1 for (ak, person) pairs where participation is required.
+    #   upper=0 for (ak, person) pairs where the person has no preference at all.
     person_lower, person_upper = _init_lower_upper([ids.ak, ids.person])
     # required aks have P_{P,A} = 1 implicitly
     person_lower = person_lower.where(~props.required_persons, 1)
@@ -83,28 +148,35 @@ def create_lp(
         (props.preferences != 0) | props.required_persons, 0
     )
 
-    # TimeImpossibleForPerson
+    # Working[person, timeslot]: upper=0 where the timeslot violates a
+    # participant's time constraint (they can never be active then).
     time_impossible_for_person_mask = (
         props.participant_time_constraints & (~props.fulfilled_time_constraints)
     ).any("time_constraint")
     person_time_lower, person_time_upper = _init_lower_upper([ids.person, ids.timeslot])
     person_time_upper = person_time_upper.where(~time_impossible_for_person_mask, 0)
 
-    # TimeImpossibleForAK
+    # Time[ak, timeslot]: upper=0 where the timeslot violates an AK's
+    # time constraint (the AK can never be scheduled at that slot).
     time_impossible_for_ak_mask = (
         props.ak_time_constraints & (~props.fulfilled_time_constraints)
     ).any("time_constraint")
     time_lower, time_upper = _init_lower_upper([ids.ak, ids.timeslot])
     time_upper = time_upper.where(~time_impossible_for_ak_mask, 0)
 
-    # RoomImpossibleForAK
+    # Room[ak, room]: upper=0 where the room fails an AK's room constraint.
     room_impossible_for_ak_mask = (
         props.ak_room_constraints & (~props.fulfilled_room_constraints)
     ).any("room_constraint")
     room_lower, room_upper = _init_lower_upper([ids.ak, ids.room])
     room_upper = room_upper.where(~room_impossible_for_ak_mask, 0)
 
-    # Fix Values for already scheduled aks
+    # -------------------------------------------------------------------------
+    # Fix values for pre-scheduled AKs (lower = upper = 1 for their assignments).
+    # -------------------------------------------------------------------------
+    # Pre-fixed AKs are represented as lower=upper=1 on the relevant variable
+    # cells.  Using integer variables (rather than binary) is required here
+    # because linopy only supports lower/upper bound fixing on integer variables.
     for scheduled_ak in input_data.scheduled_aks:
         if (
             scheduled_ak.room_id is not None
@@ -115,10 +187,14 @@ def create_lp(
         person_lower.loc[scheduled_ak.ak_id, scheduled_ak.participant_ids] = 1
         time_lower.loc[scheduled_ak.ak_id, scheduled_ak.timeslot_ids] = 1
 
-    # construct variables
+    # -------------------------------------------------------------------------
+    # Declare variables
+    # -------------------------------------------------------------------------
+    # All variables are semantically binary (0/1).  We declare them as
+    # ``integer`` rather than ``binary`` because linopy's binary variables do
+    # not support custom lower/upper bounds, which we need for fixing
+    # pre-scheduled AKs and for pruning impossible assignments above.
 
-    # all variables are binary
-    # but we use 'integer' since we manually set the lower/upper bound to fix values
     room = m.add_variables(
         name="Room",
         integer=True,
@@ -150,9 +226,15 @@ def create_lp(
     )
     logger.debug("Variables added")
 
-    # Set objective function
-    # \sum_{P,A} \frac{P_{P,A}}{\sum_{P_{P,A}}\neq 0} T_{P,A}
-
+    # -------------------------------------------------------------------------
+    # Objective function
+    # -------------------------------------------------------------------------
+    # Maximise:  Σ_{P,A}  (pref[P,A] / num_prefs[P]) * Part[P,A]
+    #
+    # Dividing by ``num_prefs_per_person`` normalises each person's
+    # contribution so that a person with 20 preferences does not dominate over
+    # a person with 3 preferences.  Required AKs (pref weight = 0) are
+    # excluded from the count — they don't contribute to the objective.
     # TODO: Do we want to include 'required' AKs?
     num_prefs_per_person = (props.preferences != 0).sum(
         "ak"
@@ -163,6 +245,13 @@ def create_lp(
     m.add_objective((weighted_prefs * person).sum(), sense="max")
     logger.debug("Objective added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: MaxOneAKPerPersonAndTime
+    # For every pair of distinct AKs (a1, a2) and every (person, timeslot):
+    #   Time[a1, t] + Part[a1, p] + Time[a2, t] + Part[a2, p] <= 3
+    # Equivalent to: a person cannot attend two AKs at the same time.
+    # (If both Time and Part are 1 for both AKs, the sum would be 4 > 3.)
+    # -------------------------------------------------------------------------
     c = time + person
     for ak_id1, ak_id2 in combinations(ids.ak, 2):
         m.add_constraints(
@@ -171,6 +260,12 @@ def create_lp(
         )
     logger.debug("Constraints MaxOneAKPerPersonAndTime added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: MaxOneAKPerRoomAndTime
+    # For every pair of distinct AKs (a1, a2) and every (room, timeslot):
+    #   Time[a1, t] + Room[a1, r] + Time[a2, t] + Room[a2, r] <= 3
+    # Equivalent to: two AKs cannot use the same room at the same time.
+    # -------------------------------------------------------------------------
     c = time + room
     for ak_id1, ak_id2 in combinations(ids.ak, 2):
         m.add_constraints(
@@ -179,14 +274,40 @@ def create_lp(
         )
     logger.debug("Constraints MaxOneAKPerRoomAndTime added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: AKDuration
+    #   Σ_t Time[a, t] >= duration[a]   for all a
+    # Each AK must be assigned at least its required number of timeslots.
+    # (Combined with AKContiguous, this becomes an equality in practice.)
+    # -------------------------------------------------------------------------
     m.add_constraints((time.sum("timeslot") >= props.ak_durations), name="AKDuration")
     logger.debug("Constraints AKDuration added")
+
+    # -------------------------------------------------------------------------
+    # Constraint: AKSingleBlock
+    #   Σ_b Block[a, b] <= 1   for all a
+    # An AK may span at most one day-block.
+    # -------------------------------------------------------------------------
     m.add_constraints((block.sum("block") <= 1), name="AKSingleBlock")
     logger.debug("Constraints AKSingleBlock added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: AKBlockAssign
+    #   Time[a, t] <= Block[a, b]   for all (a, b, t) where t in block b
+    # If an AK uses timeslot t, it must be assigned to the block that contains t.
+    # The ``.where(props.block_mask)`` filters to only the (b, t) pairs where
+    # t actually belongs to b — the mask has shape (block × timeslot).
+    # -------------------------------------------------------------------------
     m.add_constraints((time - block).where(props.block_mask) <= 0, name="AKBlockAssign")
     logger.debug("Constraints AKBlockAssign added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: Roomsize
+    #   Part[a, :].sum() + num_interested[a] * Room[a, r]
+    #       <= num_interested[a] + capacity[r]
+    # Applied only where num_interested[a] > capacity[r] (i.e. the room could
+    # actually be over-full).  Rearranged: attendees <= capacity when Room[a,r]=1.
+    # -------------------------------------------------------------------------
     m.add_constraints(
         lhs=person.sum("person") + props.ak_num_interested * room,
         sign="<=",
@@ -196,20 +317,50 @@ def create_lp(
     )
     logger.debug("Constraints Roomsize added")
 
+    # -------------------------------------------------------------------------
+    # Constraints: AtMostOneRoomPerAK / AtLeastOneRoomPerAK / RoomForAK
+    #   Σ_r Room[a, r] == 1   for all a
+    # Every AK gets exactly one room.
+    # -------------------------------------------------------------------------
     m.add_constraints(room.sum("room") <= 1, name="AtMostOneRoomPerAK")
     logger.debug("Constraints AtMostOneRoomPerAK added")
     m.add_constraints(room.sum("room") >= 1, name="AtLeastOneRoomPerAK")
     logger.debug("Constraints AtLeastOneRoomPerAK added")
+
+    # -------------------------------------------------------------------------
+    # Constraint: NotMorePeopleThanInterested
+    #   Part[a, :].sum() <= num_interested[a]   for all a
+    # The number of assigned attendees cannot exceed the number of people who
+    # expressed any interest (this also indirectly caps the objective).
+    # -------------------------------------------------------------------------
     m.add_constraints(
         person.sum("person") <= props.ak_num_interested,
         name="NotMorePeopleThanInterested",
     )
     logger.debug("Constraints NotMorePeopleThanInterested added")
+
+    # -------------------------------------------------------------------------
+    # Constraint: TimePersonVar  (linking constraint)
+    #   Time[a, t] + Part[p, a] - Working[p, t] <= 1   for all (a, p, t)
+    # Forces Working[p, t] = 1 whenever person p attends AK a AND AK a is
+    # in timeslot t.  (Working is then used by MaxOneAKPerPersonAndTime and
+    # the BreakForPerson constraint.)
+    # -------------------------------------------------------------------------
     m.add_constraints(time + person - person_time <= 1, name="TimePersonVar")
     logger.debug("Constraints TimePersonVar added")
+
+    # -------------------------------------------------------------------------
+    # Constraint: RoomForAK (duplicate of AtLeastOneRoomPerAK — kept for clarity)
+    # -------------------------------------------------------------------------
     m.add_constraints(room.sum("room") >= 1, name="RoomForAK")
     logger.debug("Constraints RoomForAK added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: RoomImpossibleForPerson
+    #   Room[a, r] + Part[p, a] <= 1
+    # Applied only where room r does NOT fulfill one of person p's room
+    # constraints.  Prevents assigning a person to an AK in an inaccessible room.
+    # -------------------------------------------------------------------------
     room_impossible_for_person_mask = (
         props.participant_room_constraints & (~props.fulfilled_room_constraints)
     ).any("room_constraint")
@@ -220,6 +371,11 @@ def create_lp(
     )
     logger.debug("Constraints RoomImpossibleForPerson added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: TimeImpossibleForRoom
+    #   Room[a, r] + Time[a, t] <= 1
+    # Applied only where room r is NOT available during timeslot t.
+    # -------------------------------------------------------------------------
     time_impossible_for_room_mask = (
         props.room_time_constraints & (~props.fulfilled_time_constraints)
     ).any("time_constraint")
@@ -230,6 +386,12 @@ def create_lp(
     )
     logger.debug("Constraints TimeImpossibleForRoom added")
 
+    # -------------------------------------------------------------------------
+    # Constraint: AKConflict
+    #   Time[a1, t] + Time[a2, t] <= 1   for all t, for all (a1, a2) in conflicts
+    # Conflicting AK pairs must not overlap in time.  This also covers
+    # dependency pairs (a dependency implies no overlap).
+    # -------------------------------------------------------------------------
     for ak_a, ak_b in props.conflict_pairs:
         m.add_constraints(
             time.loc[ak_a] + time.loc[ak_b] <= 1,
@@ -237,10 +399,20 @@ def create_lp(
         )
     logger.debug("Constraints AKConflict added")
 
-    # TODO vectorize
+    # -------------------------------------------------------------------------
+    # Constraint: AKContiguous
+    # Within a block, an AK of duration d must use d *consecutive* timeslots.
+    # For each AK and each block, for every pair of slots (s, s') in that block
+    # where s' >= s + duration:
+    #   Time[a, s] + Time[a, s'] <= 1
+    # This forbids using the first and last slot of a pair that is too far
+    # apart to be consecutive.
+    # TODO: vectorize
+    # -------------------------------------------------------------------------
     for ak_id, (block_id, block_lst) in product(ids.ak, ids.block_dict.items()):
         # AKContiguous
         for timeslot_idx, timeslot_id_a in enumerate(block_lst):
+            # Only consider s' that are at least `duration` steps ahead of s
             for timeslot_id_b in block_lst[
                 timeslot_idx + props.ak_durations.loc[ak_id].item() :
             ]:
@@ -257,15 +429,20 @@ def create_lp(
                 )
     logger.debug("Constraints AKContiguous added")
 
-    # TODO vectorize
+    # -------------------------------------------------------------------------
+    # Constraint: PersonNeedsBreak  (optional, disabled when limit == 0)
+    # Within each block, no person may be scheduled for more than
+    # `max_num_timeslots_before_break` consecutive timeslots.
+    # For each window of (limit + 1) consecutive slots:
+    #   Working[p, window].sum() <= limit
+    # TODO: vectorize
+    # -------------------------------------------------------------------------
     if input_data.config.max_num_timeslots_before_break > 0:
-        # PersonNeedsBreak
-        # Any real person needs a break after some number of time slots
-        # So in each block at most  consecutive timeslots can be active for any person
         for block_entry in ids.block_dict.values():
             for idx in range(
                 len(block_entry) - input_data.config.max_num_timeslots_before_break - 1
             ):
+                # sliding window of width (limit + 1) over the block
                 block_subset = block_entry[
                     idx : idx + input_data.config.max_num_timeslots_before_break + 1
                 ]
@@ -277,8 +454,18 @@ def create_lp(
                 )
     logger.debug("Constraints BreakForPerson added")
 
-    # TODO vectorize
-    # AK dependencies
+    # -------------------------------------------------------------------------
+    # Constraint: AKDependenciesDoneBeforeAK
+    # If AK `a` depends on AK `b`, then every timeslot used by `a` must come
+    # after every timeslot used by `b`.
+    #
+    # For each timeslot t and each (a, b) dependency pair:
+    #   Time[a, t:].sum() - Time[b, t] >= 0
+    # Meaning: if b uses slot t, then a must use some slot at or after t.
+    # Combined with the AKConflict constraint (which bans simultaneous slots),
+    # this forces `b` to finish strictly before `a` starts.
+    # TODO: vectorize
+    # -------------------------------------------------------------------------
     for ak_id in ids.ak:
         if ak_id not in props.dependencies:
             continue
@@ -308,19 +495,29 @@ def export_scheduling_result(
     solution: types.ExportTuple,
     allow_unscheduled_aks: bool = False,
 ) -> dict[types.AkId, ScheduleAtom]:
-    """Create a dictionary from the solved MILP.
+    """Extract a human-readable schedule from the solved MILP variable arrays.
+
+    Reads the three solution DataArrays (Room, Time, Part) and for each AK
+    finds which room, timeslots, and participants were assigned (value == 1).
 
     For a specification of the output format, see
     https://github.com/Die-KoMa/ak-plan-optimierung/wiki/Input-&-output-format
 
     Args:
-        input_data(SchedulingInput): The Scheduling instance.
-        solution: Named tuple with the solution values of the decision variables.
-        allow_unscheduled_aks (bool): Whether not scheduling an AK is allowed or not.
-            Defaults to False.
+        input_data: The scheduling input (used to get the list of AK IDs).
+        solution: Named tuple with the rounded binary solution arrays.
+        allow_unscheduled_aks: If ``True``, AKs with no assigned room or
+            timeslots are represented as ``ScheduleAtom(room_id=None, …)``
+            rather than raising an error.  Controlled by
+            ``ConfigData.allow_unscheduled_aks``.
 
     Returns:
-        list: The constructed output list (as specified).
+        Dict mapping each AK ID to its ``ScheduleAtom`` assignment.
+
+    Raises:
+        ValueError: If an AK is assigned to multiple rooms (should never
+            happen in a valid solution) or has no room when
+            ``allow_unscheduled_aks=False``.
     """
     ids = ProblemIds.init_from_problem(input_data)
 
@@ -349,8 +546,25 @@ def export_scheduling_result(
         allow_none: bool,
         coord: str | None = None,
     ) -> Any:
+        """Extract the IDs where a solution variable equals 1 for a given AK.
+
+        Args:
+            ak_id: The AK to inspect.
+            var_key: One of ``"room"``, ``"time"``, or ``"person"`` —
+                selects which ``ExportTuple`` field to read.
+            allow_multiple: If ``True`` return all matching IDs as an array;
+                if ``False`` expect exactly 0 or 1 match.
+            allow_none: If ``True`` a zero-match result is allowed (returns
+                ``None`` or empty array); if ``False`` it raises ``ValueError``.
+            coord: Coordinate name to extract IDs from.  Defaults to
+                ``var_key`` (works for ``"room"`` and ``"person"``).
+                Pass ``"timeslot"`` for the ``"time"`` variable because the
+                coordinate name in linopy is ``"timeslot"`` not ``"time"``.
+        """
         if coord is None:
             coord = var_key
+        # Slice the solution DataArray to the row for this AK, then keep only
+        # entries where the value is positive (i.e. == 1 after rounding).
         ak_row = getattr(solution, var_key).loc[ak_id]
         matched_ids = ak_row.where(ak_row > 0, drop=True).coords[coord]
         if not allow_multiple and matched_ids.size > 1:
@@ -375,7 +589,7 @@ def export_scheduling_result(
             timeslot_ids=_get_id(
                 ak_id=ak_id,
                 var_key="time",
-                coord="timeslot",
+                coord="timeslot",  # linopy coordinate name differs from var_key
                 allow_multiple=True,
                 allow_none=allow_unscheduled_aks,
             ),
@@ -394,10 +608,11 @@ def solve_scheduling(
     solver_config: SolverConfig,
     solver_name: str | None = None,
 ) -> tuple[linopy.Model, types.ExportTuple] | None:
-    """Solve the scheduling problem.
+    """Build and solve the MILP scheduling problem.
 
-    Solves the ILP scheduling problem described by the input data using an ILP
-    formulation.
+    Orchestrates ``create_lp`` followed by ``model.solve``.  Solver selection
+    falls back gracefully: prefers Gurobi, then HiGHS, then any available
+    linopy solver.
 
     For a specification of the input format, see
     https://github.com/Die-KoMa/ak-plan-optimierung/wiki/Input-&-output-format
@@ -405,25 +620,24 @@ def solve_scheduling(
     For a specification of the ILP used, see
     https://github.com/Die-KoMa/ak-plan-optimierung/wiki/New-LP-formulation
 
-    The ILP models each person to have three kinds of prefences for an AK:
-    0 (no preference), 1 (weak preference) and `mu` (strong preference).
-    The choice of `mu` is an hyperparameter of the ILP that weights the
+    The ILP models each person to have three kinds of preferences for an AK:
+    0 (no preference), 1 (weak preference) and ``mu`` (strong preference).
+    The choice of ``mu`` is a hyperparameter of the ILP that weights the
     balance between weak and strong preferences.
 
     Args:
-        input_data (SchedulingInput): The input data used to construct the ILP.
-        solver_config (SolverConfig): The config of the solver to apply.
-        solver_name (str, optional): The solver to use. If None, uses a
-            default solver choice. Defaults to None.
+        input_data: The parsed scheduling input.
+        solver_config: Runtime settings (time limit, threads, gap tolerance…).
+        solver_name: The linopy solver name to use.  ``None`` (default) selects
+            automatically from installed solvers in preference order.
 
     Returns:
-        If a solution is found, a tuple (`lp_problem`, `solution`)
-        where `lp_problem` is the constructed and solved linopy MILP model
-        and `solution` contains the named tuple with the solution.
-        If the model is infeasible, None is returned instead.
+        ``(model, solution)`` tuple on success, where ``solution`` is an
+        ``ExportTuple`` of rounded binary DataArrays.
+        ``None`` if the model is infeasible.
 
     Raises:
-        ValueError: if no solvers are installed.
+        ValueError: If no linopy-compatible solver is installed at all.
     """
     if not linopy.available_solvers:
         raise ValueError(
@@ -433,11 +647,14 @@ def solve_scheduling(
         )
 
     if solver_name is None:
+        # Walk the preferred solver list and take the first installed one.
         for solver_candidate in get_args(types.SupportedSolver):
             if solver_candidate in linopy.available_solvers:
                 solver_name = cast(str, solver_candidate)
                 break
         else:
+            # Fall back to whatever linopy found, but warn that performance
+            # tuning arguments may not be forwarded correctly.
             solver_name = linopy.available_solvers[0]
             logger.warning(
                 "No supported solver available. "
@@ -457,6 +674,8 @@ def solve_scheduling(
     logger.info("Solution status: %s", status)
 
     if term_cond == "infeasible":
+        # Gurobi can compute the IIS (Irreducible Infeasible Subsystem) to
+        # pinpoint which constraints conflict.  HiGHS does not support this.
         if model.solver_name == "gurobi":
             model.print_infeasibilities()
         else:
@@ -464,6 +683,9 @@ def solve_scheduling(
                 "To calculate the IIS of the infeasible model, use 'gurobi' as a solver"
             )
         return None
+
+    # Round solution values to {0, 1} to clean up floating-point noise from
+    # the solver (values like 0.9999… or 0.0001… should be exact integers).
     solution = types.ExportTuple(
         room=model.variables["Room"].solution.round(),
         time=model.variables["Time"].solution.round(),
@@ -477,15 +699,20 @@ def process_solved_lp(
     solution: types.ExportTuple,
     input_data: SchedulingInput,
 ) -> dict[types.AkId, ScheduleAtom] | None:
-    """Process the solved LP model and create a schedule output.
+    """Convert a solved linopy model into a ``dict[AkId, ScheduleAtom]``.
+
+    Thin wrapper around ``export_scheduling_result`` that first checks the
+    model status and respects the ``allow_unscheduled_aks`` config flag.
 
     Args:
-        model (linopy.Model): The linopy LP model object after the optimizer ran.
-        solution (named tuple of ILP variables): The solution to the problem.
-        input_data (SchedulingInput): The input data used to construct the ILP.
+        model: The linopy model after ``model.solve()`` has been called.
+        solution: The rounded binary solution arrays from ``solve_scheduling``.
+        input_data: The original scheduling input.
 
     Returns:
-        A dict mapping each AK ID to its scheduleing or None if scheduling failed.
+        A dict mapping every AK ID to its ``ScheduleAtom``, or ``None`` if
+        the model's status is not ``"ok"`` (e.g. time-limit with no feasible
+        solution found).
     """
     if model.status != "ok":
         return None
@@ -506,23 +733,31 @@ def calc_changed_fixed_schedule_atoms(
     ignore_timeslots_change: bool = False,
     ignore_participants_change: bool = True,
 ) -> list[ScheduleAtom]:
-    """Check if all scheduling atoms of the input are still contained in the output.
+    """Find pre-fixed AK assignments that were not preserved in the solver output.
+
+    After solving, we verify that every AK in ``input_data.scheduled_aks``
+    (the pre-fixed set) still appears unchanged in the output schedule.  If
+    ``allow_changing_rooms`` is ``True`` we ignore room differences; participant
+    changes are always ignored (the solver may optimise attendance even for
+    fixed AKs).
 
     Args:
-        input_atoms (iterable of ScheduleAtoms): The fixed schedule atoms of the input.
-        schedule_atoms (iterable of ScheduleAtoms): An iterable of the scheduled atoms.
-        ignore_room_change (bool): If True, room changes are ignored in the check.
-        ignore_timeslots_change (bool): If True, timeslots changes are ignored
-            in the check.
-        ignore_participants_change (bool): If True, participants changes
-            are ignored in the check.
+        input_atoms: The pre-fixed ``ScheduleAtom`` entries from the input.
+        schedule_atoms: The ``ScheduleAtom`` entries produced by the solver.
+        ignore_room_change: If ``True``, two atoms that differ only in
+            ``room_id`` are considered equal.
+        ignore_timeslots_change: If ``True``, timeslot differences are ignored.
+        ignore_participants_change: If ``True`` (default), participant-list
+            differences are ignored.
 
     Returns:
-        The list of all schedule atoms of the input that are not contained
-        in the output.
+        Sorted list of input atoms that are NOT present in the output
+        (after applying the ignore flags).  An empty list means all fixings
+        were respected.
     """
 
     def _stripped_atom_set(atom_it: Iterable[ScheduleAtom]) -> set[ScheduleAtom]:
+        """Convert atoms to a set, clearing the ignored fields first."""
         return {
             atom.stripped_copy(
                 strip_room=ignore_room_change,
@@ -534,13 +769,22 @@ def calc_changed_fixed_schedule_atoms(
 
     input_data_atom_set = _stripped_atom_set(input_atoms)
     schedule_atom_set = _stripped_atom_set(schedule_atoms)
+    # Set difference: atoms that were in the input but not in the output.
     changed_schedule_set = input_data_atom_set - schedule_atom_set
 
     return sorted(changed_schedule_set)
 
 
 def main() -> None:
-    """Run solve_scheduling from CLI."""
+    """CLI entry point for ``akplan-solve``.
+
+    Parses command-line arguments, reads a JSON input file, runs the solver,
+    checks that pre-fixed AKs were respected, and writes the result to a JSON
+    output file.
+
+    The output file is named ``out-<input-filename>`` by default and is placed
+    in the current working directory.  Use ``--output`` to override.
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "--solver",
@@ -629,7 +873,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    # set logging level
+    # Configure the root logger before any other logging calls.
     numeric_loglevel = getattr(logging, args.loglevel.upper(), None)
     if not isinstance(numeric_loglevel, int):
         raise ValueError(f"Invalid log level: {args.loglevel}")
@@ -643,8 +887,10 @@ def main() -> None:
         # default threads to number of available CPUs minus 1
         args.threads = default_num_threads()
 
-    # disable duplicate logging from gurobi logger
-    # https://linopy.readthedocs.io/en/latest/gurobi-double-logging.html
+    # Gurobi's Python bindings create their own logger that duplicates every
+    # message already emitted by linopy.  Detach it from the root logger to
+    # avoid doubled output.
+    # See: https://linopy.readthedocs.io/en/latest/gurobi-double-logging.html
     gurobi_logger = logging.getLogger("gurobipy")
     gurobi_logger.propagate = False
 
@@ -663,6 +909,7 @@ def main() -> None:
     with json_file.open("r") as f:
         input_dict = json.load(f)
 
+    # Default output path: prepend "out-" to the input filename, place in CWD.
     if args.output is None:
         args.output = Path.cwd() / f"out-{json_file.name}"
 
@@ -671,7 +918,7 @@ def main() -> None:
             f"Output file {args.output} already exists. We do not simply override it."
         )
 
-    # create directory tree
+    # Ensure the output directory exists (supports nested paths via --output).
     args.output.parent.mkdir(exist_ok=True, parents=True)
 
     scheduling_input = SchedulingInput.from_dict(input_dict)
@@ -683,23 +930,26 @@ def main() -> None:
     )
 
     if solution_tuple is None:
-        # if no solution was found, exit
+        # Infeasible — solver already printed diagnostics; nothing to write.
         return
 
     schedule = process_solved_lp(*solution_tuple, input_data=scheduling_input)
 
     if schedule is None:
-        # if no schedule was calculated, exit
+        # Model status was not "ok" (e.g. no feasible solution within time limit).
         return
 
+    # -------------------------------------------------------------------------
+    # Integrity check: verify that every pre-fixed AK assignment was honoured.
+    # Emit a warning (not an error) so the user can investigate without losing
+    # the (possibly useful) partial result.
+    # -------------------------------------------------------------------------
     changed_fixed_schedule_atoms = calc_changed_fixed_schedule_atoms(
         scheduling_input.scheduled_aks,
         schedule.values(),
         ignore_room_change=scheduling_input.config.allow_changing_rooms,
     )
 
-    # check if all fixed schedule atoms of the input are carried over to the output
-    # if not: print warning with affected AKs
     if changed_fixed_schedule_atoms:
         string_repr = [
             (
@@ -716,6 +966,7 @@ def main() -> None:
             "\n".join(string_repr),
         )
 
+    # Write output: the schedule plus an echo of the input for traceability.
     out_dict = {
         "scheduled_aks": list(map(asdict, schedule.values())),
         "input": scheduling_input.to_dict(),
