@@ -674,13 +674,18 @@ def solve_scheduling(
     logger.info("Solution status: %s", status)
 
     if term_cond == "infeasible":
-        # Gurobi can compute the IIS (Irreducible Infeasible Subsystem) to
-        # pinpoint which constraints conflict.  HiGHS does not support this.
-        if model.solver_name == "gurobi":
-            model.print_infeasibilities()
+        # Gurobi and Xpress can compute the IIS (Irreducible Infeasible Subsystem)
+        # to pinpoint the minimal set of conflicting constraints.
+        # HiGHS does not support IIS computation (linopy limitation).
+        if model.solver_name in ("gurobi", "xpress"):
+            logger.warning(
+                "Infeasible model. Conflicting constraints (IIS):\n%s",
+                model.format_infeasibilities(),
+            )
         else:
             logger.warning(
-                "To calculate the IIS of the infeasible model, use 'gurobi' as a solver"
+                "Infeasible model. To compute the IIS and identify conflicting "
+                "constraints, re-run with '--solver gurobi' or '--solver xpress'."
             )
         return None
 
