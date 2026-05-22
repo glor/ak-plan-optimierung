@@ -7,6 +7,7 @@
 | Document | What you'll find |
 |---|---|
 | [Overview](overview.md) | What the project is, the high-level workflow, package structure, and key dependencies |
+| [Repository Structure](repo-structure.md) | Annotated file tree, per-file reference for every module, workflow, and config file |
 | [Data Model & JSON Format](data-model.md) | Input/output JSON schema, all fields explained, Python dataclass hierarchy |
 | [MILP Formulation](algorithm.md) | Decision variables, objective function, every hard constraint, solver interface |
 | [Development Guide](development.md) | Setup, CLI usage, Python API, test-input generator, nox sessions, test suite |
