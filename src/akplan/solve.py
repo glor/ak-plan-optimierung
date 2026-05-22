@@ -48,7 +48,6 @@ import json
 import logging
 from collections.abc import Iterable
 from dataclasses import asdict
-from itertools import combinations, product
 from pathlib import Path
 from time import perf_counter
 from typing import Any, Literal, TypeVar, cast, get_args, overload
@@ -246,18 +245,33 @@ def create_lp(
     logger.debug("Objective added")
 
     # -------------------------------------------------------------------------
+    # Shared upper-triangular mask for all pair-wise AK constraints.
+    # ak_pair_mask[ak1, ak2] = True iff ak1 < ak2 (canonical order: no
+    # self-pairs, no duplicate reversed pairs).  Reused for both
+    # MaxOneAKPerPersonAndTime and MaxOneAKPerRoomAndTime below.
+    # -------------------------------------------------------------------------
+    ak_pair_mask = xr.DataArray(
+        np.triu(np.ones((len(ids.ak), len(ids.ak)), dtype=bool), k=1),
+        coords=[ids.ak.rename("ak1"), ids.ak.rename("ak2")],
+    )
+
+    # -------------------------------------------------------------------------
     # Constraint: MaxOneAKPerPersonAndTime
     # For every pair of distinct AKs (a1, a2) and every (person, timeslot):
     #   Time[a1, t] + Part[a1, p] + Time[a2, t] + Part[a2, p] <= 3
     # Equivalent to: a person cannot attend two AKs at the same time.
     # (If both Time and Part are 1 for both AKs, the sum would be 4 > 3.)
+    #
+    # Vectorised: rename 'ak' → 'ak1'/'ak2' on two copies of the expression
+    # so xarray broadcasts to shape (ak1 × ak2 × timeslot × person); the
+    # upper-triangular mask restricts to canonical (ak1 < ak2) pairs only.
     # -------------------------------------------------------------------------
-    c = time + person
-    for ak_id1, ak_id2 in combinations(ids.ak, 2):
-        m.add_constraints(
-            (c.loc[ak_id1] + c.loc[ak_id2] <= 3),
-            name=_construct_constraint_name("MaxOneAKPerPersonAndTime", ak_id1, ak_id2),
-        )
+    c = time + person  # shape: (ak, timeslot, person)
+    m.add_constraints(
+        c.rename({"ak": "ak1"}) + c.rename({"ak": "ak2"}) <= 3,
+        mask=ak_pair_mask,
+        name="MaxOneAKPerPersonAndTime",
+    )
     logger.debug("Constraints MaxOneAKPerPersonAndTime added")
 
     # -------------------------------------------------------------------------
@@ -266,12 +280,12 @@ def create_lp(
     #   Time[a1, t] + Room[a1, r] + Time[a2, t] + Room[a2, r] <= 3
     # Equivalent to: two AKs cannot use the same room at the same time.
     # -------------------------------------------------------------------------
-    c = time + room
-    for ak_id1, ak_id2 in combinations(ids.ak, 2):
-        m.add_constraints(
-            (c.loc[ak_id1] + c.loc[ak_id2] <= 3),
-            name=_construct_constraint_name("MaxOneAKPerRoomAndTime", ak_id1, ak_id2),
-        )
+    c = time + room  # shape: (ak, timeslot, room)
+    m.add_constraints(
+        c.rename({"ak": "ak1"}) + c.rename({"ak": "ak2"}) <= 3,
+        mask=ak_pair_mask,
+        name="MaxOneAKPerRoomAndTime",
+    )
     logger.debug("Constraints MaxOneAKPerRoomAndTime added")
 
     # -------------------------------------------------------------------------
@@ -400,33 +414,57 @@ def create_lp(
     logger.debug("Constraints AKConflict added")
 
     # -------------------------------------------------------------------------
-    # Constraint: AKContiguous
+    # Constraint: AKContiguous (vectorised)
     # Within a block, an AK of duration d must use d *consecutive* timeslots.
-    # For each AK and each block, for every pair of slots (s, s') in that block
-    # where s' >= s + duration:
-    #   Time[a, s] + Time[a, s'] <= 1
-    # This forbids using the first and last slot of a pair that is too far
-    # apart to be consecutive.
-    # TODO: vectorize
+    # For each AK and each pair of timeslots (ta, tb) where ta and tb are in
+    # the same block and tb is at least duration[ak] positions ahead of ta:
+    #   Time[ak, ta] + Time[ak, tb] <= 1
+    # This forbids any two timeslot assignments that are too far apart to form
+    # a contiguous run of the required length.
+    #
+    # Build a boolean (ak × timeslot_a × timeslot_b) mask in numpy, then call
+    # add_constraints once instead of looping over all (ak, block, ta, tb)
+    # triples.
     # -------------------------------------------------------------------------
-    for ak_id, (block_id, block_lst) in product(ids.ak, ids.block_dict.items()):
-        # AKContiguous
-        for timeslot_idx, timeslot_id_a in enumerate(block_lst):
-            # Only consider s' that are at least `duration` steps ahead of s
-            for timeslot_id_b in block_lst[
-                timeslot_idx + props.ak_durations.loc[ak_id].item() :
-            ]:
-                m.add_constraints(
-                    time.loc[ak_id, [timeslot_id_a, timeslot_id_b]].sum("timeslot")
-                    <= 1,
-                    name=_construct_constraint_name(
-                        "AKContiguous",
-                        ak_id,
-                        block_id,
-                        timeslot_id_a,
-                        timeslot_id_b,
-                    ),
-                )
+    ts_list = list(ids.timeslot)
+    n_ts = len(ts_list)
+    ts_idx_map = {int(ts_id): i for i, ts_id in enumerate(ts_list)}
+
+    # For every timeslot: record its block index and its position within that block.
+    ts_block_arr = np.empty(n_ts, dtype=int)
+    ts_pos_arr = np.empty(n_ts, dtype=int)
+    for block_id, block_lst in ids.block_dict.items():
+        for pos, ts_id in enumerate(block_lst):
+            i = ts_idx_map[int(ts_id)]
+            ts_block_arr[i] = int(block_id)
+            ts_pos_arr[i] = pos
+
+    # same_block[i, j] = True iff timeslots i and j belong to the same block.
+    same_block = ts_block_arr[:, None] == ts_block_arr[None, :]  # (n_ts, n_ts)
+
+    # pos_diff[i, j] = position(j) − position(i) within their block.
+    pos_diff = ts_pos_arr[None, :] - ts_pos_arr[:, None]  # (n_ts, n_ts)
+
+    # ak_dur[k] = required duration for AK at index k.
+    ak_dur = np.array([props.ak_durations.loc[ak_id].item() for ak_id in ids.ak])
+
+    # ak_contiguous_mask[ak, ta, tb]:
+    #   True iff ta and tb are in the same block AND tb ≥ ta + duration[ak].
+    ak_contiguous_mask = xr.DataArray(
+        same_block[None, :, :] & (pos_diff[None, :, :] >= ak_dur[:, None, None]),
+        coords=[
+            ids.ak,
+            pd.Index(ts_list, name="timeslot_a"),
+            pd.Index(ts_list, name="timeslot_b"),
+        ],
+    )
+
+    m.add_constraints(
+        time.rename({"timeslot": "timeslot_a"}) + time.rename({"timeslot": "timeslot_b"})
+        <= 1,
+        mask=ak_contiguous_mask,
+        name="AKContiguous",
+    )
     logger.debug("Constraints AKContiguous added")
 
     # -------------------------------------------------------------------------

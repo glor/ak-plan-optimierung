@@ -27,6 +27,7 @@ dependencies = [
     "pandas",
     "xarray",
     "linopy",
+    "highspy>=1.14.0",
 ]
 
 [project.optional-dependencies]
